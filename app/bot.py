@@ -18,7 +18,6 @@ def get_db_connection():
         port=os.getenv('DB_PORT'),
     )
 
-# Обработчик команды /start
 @bot.message_handler(commands=['start'])
 def privet_command(message):
     keyboard = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -32,6 +31,8 @@ def privet_command(message):
 
     bot.send_message(message.chat.id, "Привет, я бот интернет-магазина!", reply_markup=keyboard)
 
+
+
 @bot.message_handler(func=lambda message: message.text == "Каталог")
 def show_catalog(message):
     conn = get_db_connection()
@@ -42,15 +43,12 @@ def show_catalog(message):
     conn.close()
 
     if goods:
-        for name, description, quantity, image_path in goods:
+        for name, description, quantity, image_url in goods:
             product_message = f"Название: {name}\nОписание: {description}\nКоличество: {quantity}"
 
-            if os.path.exists(image_path):
-                with open(image_path, 'rb') as photo:
-                    bot.send_photo(message.chat.id, photo, caption=product_message)
-            else:
-                bot.send_message(message.chat.id, product_message + "\n(Изображение не найдено)")
-
+            print(f"Отправляю фото: {image_url}")  # Проверяем ссылку
+            
+            bot.send_photo(message.chat.id, image_url, caption=product_message)
     else:
         bot.send_message(message.chat.id, "В каталоге нет товаров.")
 

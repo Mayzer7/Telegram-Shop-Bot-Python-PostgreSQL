@@ -1,16 +1,16 @@
 import os
 import telebot
+import requests
 from dotenv import load_dotenv
 import psycopg2
 
 # Загружаем переменные окружения
 load_dotenv()
 bot_token = os.getenv('BOT_TOKEN')
-admin_password = os.getenv('ADMIN_PASSWORD')
+imgbb_api_key = os.getenv('IMGBB_API_KEY')
 
 bot = telebot.TeleBot(bot_token)
 
-# Подключение к БД
 def get_db_connection():
     return psycopg2.connect(
         dbname=os.getenv('DB_NAME'),
@@ -20,17 +20,28 @@ def get_db_connection():
         port=os.getenv('DB_PORT'),
     )
 
-# Папка для изображений
-IMAGE_FOLDER = 'images/goods/'
-os.makedirs(IMAGE_FOLDER, exist_ok=True)  # Создаёт папку, если её нет
+# Функция загрузки изображения в imgbb
+def upload_to_imgbb(image_path):
+    url = "https://api.imgbb.com/1/upload"
+    with open(image_path, "rb") as file:
+        response = requests.post(url, data={"key": imgbb_api_key}, files={"image": file})
+    
+    print(response.json())  # Смотрим, что возвращает API
+
+    if response.status_code == 200:
+        return response.json()["data"]["image"]["url"]  # Правильный путь
+    else:
+        print("Ошибка загрузки:", response.json())
+        return None
+
 
 # Добавление товара в БД
-def add_product_to_db(name, description, quantity, image_path):
+def add_product_to_db(name, description, quantity, image_url):
     conn = get_db_connection()
     cursor = conn.cursor()
     cursor.execute(
         "INSERT INTO goods (name, description, quantity, image_url) VALUES (%s, %s, %s, %s)",
-        (name, description, quantity, image_path)
+        (name, description, quantity, image_url)
     )
     conn.commit()
     cursor.close()
@@ -39,7 +50,7 @@ def add_product_to_db(name, description, quantity, image_path):
 # Обработчик команды /start
 @bot.message_handler(commands=['start'])
 def privet_command(message):
-    bot.send_message(message.chat.id, "Привет, я администратинвый бот интернет-магазина, введи команду /add_product для добавления товара в базу данных!")
+    bot.send_message(message.chat.id, "Привет, я административный бот интернет-магазина, введи команду /add_product для добавления товара!")
 
 # Запуск добавления товара
 @bot.message_handler(commands=['add_product'])
@@ -72,19 +83,27 @@ def get_product_image(message, product_name, product_description, product_quanti
         file_path = file_info.file_path
         downloaded_file = bot.download_file(file_path)
 
-        # Сохранение изображения
+        # Сохраняем временный файл
         image_name = f"{product_name.replace(' ', '_')}.jpg"
-        image_full_path = os.path.join(IMAGE_FOLDER, image_name)
+        local_image_path = f"temp_{image_name}"
 
-        with open(image_full_path, 'wb') as new_file:
+        with open(local_image_path, "wb") as new_file:
             new_file.write(downloaded_file)
 
-        # Сохраняем относительный путь в БД
-        add_product_to_db(product_name, product_description, product_quantity, image_full_path)
+        # Загружаем в imgbb
+        image_url = upload_to_imgbb(local_image_path)
 
-        bot.send_message(message.chat.id, f"Товар '{product_name}' успешно добавлен!")
+        # Удаляем временный файл
+        os.remove(local_image_path)
+
+        if image_url:
+            add_product_to_db(product_name, product_description, product_quantity, image_url)
+            bot.send_message(message.chat.id, f"Товар '{product_name}' успешно добавлен!")
+        else:
+            bot.send_message(message.chat.id, "Ошибка загрузки фото. Попробуйте снова.")
     else:
         bot.send_message(message.chat.id, "Пожалуйста, отправьте изображение.")
 
-# Запускаем бота
+
+# ЗАПУСКАЕМ БОТА
 bot.polling(none_stop=True)
