@@ -6,11 +6,24 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeybo
 from aiogram.dispatcher.filters import Command
 from aiogram.utils import executor
 
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
+
+
 load_dotenv()
 bot_token = os.getenv('BOT_TOKEN')
 
 bot = Bot(token=bot_token)
 dp = Dispatcher(bot)
+
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+
+# Инициализация хранилища состояний
+storage = MemoryStorage()
+
+# Инициализация Dispatcher с хранилищем
+dp = Dispatcher(bot, storage=storage)
 
 # Подключение к БД
 def get_db_connection():
@@ -21,6 +34,11 @@ def get_db_connection():
         host=os.getenv('DB_HOST'),
         port=os.getenv('DB_PORT'),
     )
+
+
+# Состояния для процесса покупки товара
+class PurchaseStates(StatesGroup):
+    waiting_for_quantity = State()
 
 # Хендлер для команды /start
 @dp.message_handler(Command("start"))
@@ -53,7 +71,7 @@ async def show_catalog(message: types.Message):
 
             # Создаем inline кнопку "Купить"
             markup = InlineKeyboardMarkup()
-            buy_button = InlineKeyboardButton("Купить", callback_data=f"buy_{product_id}_{price}")
+            buy_button = InlineKeyboardButton("Купить", callback_data=f"buy_{product_id}_{quantity}_{price}")
             markup.add(buy_button)
 
             # Отправляем товар с кнопкой
@@ -61,56 +79,53 @@ async def show_catalog(message: types.Message):
     else:
         await message.answer("В каталоге нет товаров.")
 
-# Хендлер для обработки инлайн кнопки "Купить"
-@dp.callback_query_handler(lambda call: call.data.startswith("buy_"))
-async def handle_buy(call: types.CallbackQuery):
-    # Извлекаем id товара и цену из callback_data
-    product_id, price = call.data.split("_")[1], call.data.split("_")[2]
-    price = float(price)  # Преобразуем цену в число с плавающей точкой
+# Хендлер для кнопки "Купить"
+@dp.callback_query_handler(lambda c: c.data.startswith('buy_'))
+async def buy_product(callback_query: types.CallbackQuery, state: FSMContext):
+    # Извлекаем данные из callback_data
+    product_id, product_quantity, product_price = callback_query.data.split('_')[1:]
+    product_id = int(product_id)
+    product_quantity = int(product_quantity)
+    product_price = float(product_price)
 
-    # Получаем информацию о товаре из БД
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT name FROM goods WHERE id = %s", (product_id,))
-    product = cursor.fetchone()
-    cursor.close()
-    conn.close()
+    # Запрашиваем количество товара
+    await callback_query.message.answer(f"Сколько товара вы хотите купить? Доступно на складе: {product_quantity}")
+    
+    # Сохраняем данные о товаре в состоянии
+    await state.update_data(product_id=product_id, product_quantity=product_quantity, product_price=product_price)
+    
+    await PurchaseStates.waiting_for_quantity.set()
 
-    if product:
-        product_name = product[0]
-        
-        # Создаем inline кнопки "Да" и "Нет"
-        markup = InlineKeyboardMarkup()
-        yes_button = InlineKeyboardButton("Да", callback_data=f"confirm_buy_{product_id}_{price}")
-        no_button = InlineKeyboardButton("Нет", callback_data="cancel_buy")
-        markup.add(yes_button, no_button)
+# Хендлер для получения количества товара
+@dp.message_handler(state=PurchaseStates.waiting_for_quantity)
+async def get_product_quantity(message: types.Message, state: FSMContext):
+    try:
+        quantity = int(message.text)
+        user_data = await state.get_data()
+        product_id = user_data['product_id']
+        product_quantity = user_data['product_quantity']
+        product_price = user_data['product_price']
 
-        # Спрашиваем пользователя, хочет ли он купить товар
-        await call.message.answer(f"Вы хотите купить товар с названием: {product_name} за {price} руб.?", reply_markup=markup)
+        # Проверяем, достаточно ли товара на складе
+        if quantity > product_quantity:
+            await message.answer(f"На складе нет такого количества товара. Доступно всего: {product_quantity}. Введите количество заново.")
+        else:
+            # Добавляем товар в корзину с указанным количеством
+            conn = get_db_connection()
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO carts (user_id, product_id, price, quantity) 
+                VALUES (%s, %s, %s, %s)
+            """, (message.from_user.id, product_id, product_price, quantity))
+            conn.commit()
+            cursor.close()
+            conn.close()
 
-# Хендлер для подтверждения покупки
-@dp.callback_query_handler(lambda call: call.data.startswith("confirm_buy_"))
-async def confirm_buy(call: types.CallbackQuery):
-    # Извлекаем id товара и цену из callback_data
-    product_id, price = call.data.split("_")[2], float(call.data.split("_")[3])
-    user_id = call.from_user.id  # Идентификатор пользователя
+            await message.answer(f"Товар успешно добавлен в корзину! {quantity} шт. по цене {product_price} руб. за штуку.")
+            await state.finish()  # Завершаем процесс
+    except ValueError:
+        await message.answer("Пожалуйста, введите количество числом.")
 
-    # Добавляем товар в корзину
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO carts (user_id, product_id, price) VALUES (%s, %s, %s)", (user_id, product_id, price))
-    conn.commit()
-    cursor.close()
-    conn.close()
-
-    await call.message.answer("Товар добавлен в корзину! Спасибо за покупку.")
-
-# Хендлер для отмены покупки
-@dp.callback_query_handler(lambda call: call.data == "cancel_buy")
-async def cancel_buy(call: types.CallbackQuery):
-    await call.message.answer("Вы отменили покупку.")
-
-# Хендлер для отображения корзины
 # Хендлер для отображения корзины
 @dp.message_handler(lambda message: message.text == "Корзина")
 async def show_cart(message: types.Message):
@@ -120,7 +135,7 @@ async def show_cart(message: types.Message):
 
     # Получаем товары из корзины с image_url
     cursor.execute("""
-        SELECT g.name, g.price, g.image_url, c.id
+        SELECT g.name, g.price, g.image_url, c.id, c.quantity
         FROM carts c
         JOIN goods g ON c.product_id = g.id
         WHERE c.user_id = %s
@@ -135,21 +150,19 @@ async def show_cart(message: types.Message):
 
         # Добавляем товары в сообщение и создаем кнопки для удаления
         for item in cart_items:
-            name, price, image_url, cart_item_id = item
-            
+            name, price, image_url, cart_item_id, quantity = item
+
+            # Вычисляем итоговую цену
+            total_price = price * quantity
+
             # Создаем inline кнопку "Удалить"
             remove_button = InlineKeyboardButton("Удалить", callback_data=f"remove_{cart_item_id}")
-
-            # Создаем отдельный markup для каждого товара
             markup = InlineKeyboardMarkup().add(remove_button)
 
             # Отправляем изображение товара с описанием и кнопкой удаления
-            await message.answer_photo(image_url, caption=f"{name} - {price} руб.", reply_markup=markup)
+            await message.answer_photo(image_url, caption=f"{name} - {price} руб. (Количество: {quantity})\nИтоговая цена: {total_price} руб.", reply_markup=markup)
     else:
         await message.answer("Ваша корзина пуста.")
-
-
-
 
 # Хендлер для удаления товара из корзины
 @dp.callback_query_handler(lambda call: call.data.startswith("remove_"))
