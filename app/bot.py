@@ -58,10 +58,10 @@ async def privet_command(message: types.Message):
     # Создаем клавиатуру
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
     buttons = [
-        KeyboardButton("Каталог"),
-        KeyboardButton("Корзина"),
-        KeyboardButton("Мои заказы"),
-        KeyboardButton("Мой баланс")
+        KeyboardButton("🔍Каталог"),
+        KeyboardButton("🛒Корзина"),
+        KeyboardButton("📖Мои заказы"),
+        KeyboardButton("💰Мой баланс")
     ]
     keyboard.add(*buttons)
     
@@ -70,8 +70,10 @@ async def privet_command(message: types.Message):
 
 
 # Хендлер для отображения каталога товаров
-@dp.message_handler(lambda message: message.text == "Каталог")
+@dp.message_handler(lambda message: message.text == "🔍Каталог")
 async def show_catalog(message: types.Message):
+    await message.answer("🔍Каталог товаров:")
+
     async with db_pool.acquire() as conn:
         goods = await conn.fetch("SELECT id, name, description, quantity, price, image_url FROM goods")
 
@@ -140,7 +142,7 @@ async def get_product_quantity(message: types.Message, state: FSMContext):
         await message.answer("Пожалуйста, введите количество числом.")
 
 # Хендлер для отображения корзины
-@dp.message_handler(lambda message: message.text == "Корзина")
+@dp.message_handler(lambda message: message.text == "🛒Корзина")
 async def show_cart(message: types.Message):
     user_id = message.from_user.id
 
@@ -167,7 +169,7 @@ async def show_cart(message: types.Message):
             total_sum += total_price  # Добавляем к общей сумме
 
             # Создаем inline кнопку "Удалить"
-            remove_button = InlineKeyboardButton("Удалить", callback_data=f"remove_{cart_item_id}")
+            remove_button = InlineKeyboardButton("Удалить ❌", callback_data=f"remove_{cart_item_id}")
             markup = InlineKeyboardMarkup().add(remove_button)
 
             # Отправляем изображение товара с описанием и кнопкой удаления
@@ -270,8 +272,10 @@ async def process_checkout(callback_query: types.CallbackQuery):
 
 
 # Хендлер для кнопки "Мои заказы"
-@dp.message_handler(lambda message: message.text == "Мои заказы")
+@dp.message_handler(lambda message: message.text == "📖Мои заказы")
 async def show_orders(message: types.Message):
+    await message.answer("📖Ваши заказы:")
+
     user_id = message.from_user.id
 
     async with db_pool.acquire() as conn:
@@ -290,26 +294,35 @@ async def show_orders(message: types.Message):
             total_price = order["total_price"]
             created_at = order["created_at"].strftime("%d.%m.%Y %H:%M")
 
-            # Получаем товары для этого заказа
-            items = await conn.fetch(
-                "SELECT product_name, quantity, price FROM order_items WHERE order_id = $1",
-                order_id
-            )
+            # Получаем товары для этого заказа + image_url
+            items = await conn.fetch("""
+                SELECT oi.product_name, oi.quantity, oi.price, g.image_url
+                FROM order_items oi
+                JOIN goods g ON oi.product_name = g.name
+                WHERE oi.order_id = $1
+            """, order_id)
 
-            items_text = "\n".join(
-                [f"📦 {item['product_name']} (x{item['quantity']}) - {item['price']} руб за 1шт." for item in items]
-            )
+            # Формируем сообщения
+            for item in items:
+                product_name = item["product_name"]
+                quantity = item["quantity"]
+                price = item["price"]
+                image_url = item["image_url"]
 
-            text = (f"📋 Заказ №{order_id} от {created_at}\n\n"
-                    f"{items_text}\n\n"
-                    f"💰 Итоговая сумма: {total_price} руб.")   
+                text = (
+                    f"📋 Заказ №{order_id} от {created_at}\n\n"
+                    f"📦 {product_name} (x{quantity}) - {price} руб за 1шт.\n\n"
+                )
 
-            await message.answer(text)
+                # Отправляем изображение + текст
+                await message.answer_photo(photo=image_url, caption=text)
+
+            await message.answer(f"💰 Итоговая сумма: {total_price} руб.")
 
     await message.answer("👨🏻‍💻 ***По поводу срока выполнения заказа и доставки с вами свяжется менеджер\!***", parse_mode="MarkdownV2")
 
 # Хендлер для кнопки "Мой баланс"
-@dp.message_handler(lambda message: message.text == "Мой баланс")
+@dp.message_handler(lambda message: message.text == "💰Мой баланс")
 async def show_balance(message: types.Message):
     user_id = message.from_user.id
 
