@@ -19,13 +19,18 @@ bot = Bot(token=bot_token)
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-async def get_db_connection():
-    return await asyncpg.connect(
+db_pool = None
+
+async def create_db_pool():
+    global db_pool
+    db_pool = await asyncpg.create_pool(
         user=os.getenv('DB_USER'),
         password=os.getenv('DB_PASSWORD'),
         database=os.getenv('DB_NAME'),
         host=os.getenv('DB_HOST'),
         port=os.getenv('DB_PORT'),
+        min_size=1,
+        max_size=10
     )
 
 async def upload_to_imgbb(image_path):
@@ -42,12 +47,11 @@ async def upload_to_imgbb(image_path):
                 return None
 
 async def add_product_to_db(name, description, quantity, price, image_url):
-    conn = await get_db_connection()
-    await conn.execute(
-        "INSERT INTO goods (name, description, quantity, price, image_url) VALUES ($1, $2, $3, $4, $5)",
-        name, description, quantity, price, image_url
-    )
-    await conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO goods (name, description, quantity, price, image_url) VALUES ($1, $2, $3, $4, $5)",
+            name, description, quantity, price, image_url
+        )
 
 class ProductStates(StatesGroup):
     waiting_for_name = State()
@@ -116,5 +120,9 @@ async def get_product_image(message: types.Message, state: FSMContext):
         await message.answer("Ошибка загрузки фото.")
     await state.finish()
 
+async def main():
+    await create_db_pool()  # Запускаем пул соединений
+    await dp.start_polling()  # Запускаем бота
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())  # Асинхронно запускаем бота

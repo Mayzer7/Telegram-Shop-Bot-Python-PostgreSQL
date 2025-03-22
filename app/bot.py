@@ -1,21 +1,21 @@
 import os
+import asyncpg
+import asyncio
+
 from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ReplyKeyboardMarkup, KeyboardButton
-from aiogram.dispatcher.filters import Command
-from aiogram.utils import executor
 
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.dispatcher.filters import Command
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
+
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
 load_dotenv()
 bot_token = os.getenv('BOT_TOKEN')
 
 bot = Bot(token=bot_token)
-dp = Dispatcher(bot)
-
-from aiogram.contrib.fsm_storage.memory import MemoryStorage
 
 # Инициализация хранилища состояний
 storage = MemoryStorage()
@@ -23,17 +23,17 @@ storage = MemoryStorage()
 # Инициализация Dispatcher с хранилищем
 dp = Dispatcher(bot, storage=storage)
 
-import asyncpg
+db_pool = None
 
-async def get_db_connection():
-    return await asyncpg.connect(
+async def create_db_pool():
+    global db_pool
+    db_pool = await asyncpg.create_pool(
         user=os.getenv('DB_USER'),
         password=os.getenv('DB_PASSWORD'),
         database=os.getenv('DB_NAME'),
         host=os.getenv('DB_HOST'),
         port=os.getenv('DB_PORT')
     )
-
 
 # Состояния для процесса покупки товара
 class PurchaseStates(StatesGroup):
@@ -46,17 +46,14 @@ class BalanceStates(StatesGroup):
 # Хендлер для команды /start
 @dp.message_handler(Command("start"))
 async def privet_command(message: types.Message):
-    # Проверяем, есть ли пользователь в базе данных
-    conn = await get_db_connection()
-    user_exists = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", message.from_user.id)
-    
-    if not user_exists:  # Если пользователь еще не добавлен в базу данных
-        await conn.execute("""
-            INSERT INTO users (telegram_id, username, balance) 
-            VALUES ($1, $2, $3)
-        """, message.from_user.id, message.from_user.username, 0)  # Баланс по умолчанию = 0
-    
-    await conn.close()  # Закрываем соединение с базой данных
+    async with db_pool.acquire() as conn:  # Теперь conn объявлен правильно
+        user_exists = await conn.fetchrow("SELECT id FROM users WHERE telegram_id = $1", message.from_user.id)
+        
+        if not user_exists:  # Если пользователя нет, добавляем его в БД
+            await conn.execute("""
+                INSERT INTO users (telegram_id, username, balance) 
+                VALUES ($1, $2, $3)
+            """, message.from_user.id, message.from_user.username, 0)  # Баланс по умолчанию = 0
 
     # Создаем клавиатуру
     keyboard = ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
@@ -71,12 +68,12 @@ async def privet_command(message: types.Message):
     # Отправляем приветственное сообщение
     await message.answer("Привет, я бот интернет-магазина!", reply_markup=keyboard)
 
+
 # Хендлер для отображения каталога товаров
 @dp.message_handler(lambda message: message.text == "Каталог")
 async def show_catalog(message: types.Message):
-    conn = await get_db_connection()
-    goods = await conn.fetch("SELECT id, name, description, quantity, price, image_url FROM goods")
-    await conn.close()
+    async with db_pool.acquire() as conn:
+        goods = await conn.fetch("SELECT id, name, description, quantity, price, image_url FROM goods")
 
     if goods:
         for product in goods:
@@ -131,12 +128,11 @@ async def get_product_quantity(message: types.Message, state: FSMContext):
             await message.answer(f"На складе нет такого количества товара. Доступно всего: {product_quantity}. Введите количество заново или напишите 'отмена'.")
         else:
             # Добавляем товар в корзину с указанным количеством
-            conn = await get_db_connection()
-            await conn.execute("""
-                INSERT INTO carts (user_id, product_id, price, quantity) 
-                VALUES ($1, $2, $3, $4)
-            """, message.from_user.id, product_id, product_price, quantity)
-            await conn.close()
+            async with db_pool.acquire() as conn:
+                await conn.execute("""
+                    INSERT INTO carts (user_id, product_id, price, quantity) 
+                    VALUES ($1, $2, $3, $4)
+                """, message.from_user.id, product_id, product_price, quantity)
 
             await message.answer(f"Товар успешно добавлен в корзину! {quantity} шт. по цене {product_price} руб. за штуку.")
             await state.finish()  # Завершаем процесс
@@ -147,17 +143,15 @@ async def get_product_quantity(message: types.Message, state: FSMContext):
 @dp.message_handler(lambda message: message.text == "Корзина")
 async def show_cart(message: types.Message):
     user_id = message.from_user.id
-    conn = await get_db_connection()
 
     # Получаем товары из корзины с image_url
-    cart_items = await conn.fetch("""
-        SELECT g.name, g.price, g.image_url, c.id, c.quantity
-        FROM carts c
-        JOIN goods g ON c.product_id = g.id
-        WHERE c.user_id = $1
-    """, user_id)
-
-    await conn.close()
+    async with db_pool.acquire() as conn:
+        cart_items = await conn.fetch("""
+            SELECT g.name, g.price, g.image_url, c.id, c.quantity
+            FROM carts c
+            JOIN goods g ON c.product_id = g.id
+            WHERE c.user_id = $1
+        """, user_id)
 
     if cart_items:
         await message.answer("🛒 Ваша корзина:")
@@ -199,9 +193,8 @@ async def remove_from_cart(call: types.CallbackQuery):
     cart_item_id = int(call.data.split("_")[1])  # Преобразуем в целое число
 
     # Удаляем товар из корзины
-    conn = await get_db_connection()
-    await conn.execute("DELETE FROM carts WHERE id = $1", cart_item_id)
-    await conn.close()
+    async with db_pool.acquire() as conn:
+        await conn.execute("DELETE FROM carts WHERE id = $1", cart_item_id)
 
     await call.message.answer("Товар удален из корзины.")
     # Обновляем корзину
@@ -212,119 +205,117 @@ async def remove_from_cart(call: types.CallbackQuery):
 @dp.callback_query_handler(lambda c: c.data == "checkout_order")
 async def process_checkout(callback_query: types.CallbackQuery):
     user_id = callback_query.from_user.id
-    conn = await get_db_connection()
 
-    # Получаем баланс пользователя
-    balance_row = await conn.fetchrow("SELECT balance FROM users WHERE telegram_id = $1", user_id)
-    balance = balance_row["balance"] if balance_row else 0
+    async with db_pool.acquire() as conn:
+        async with conn.transaction():  # Открываем транзакцию
+            
+            # Получаем баланс пользователя
+            balance_row = await conn.fetchrow("SELECT balance FROM users WHERE telegram_id = $1", user_id)
+            balance = balance_row["balance"] if balance_row else 0
 
-    # Получаем товары из корзины
-    cart_items = await conn.fetch("""
-        SELECT g.id, g.name, g.price, c.quantity
-        FROM carts c
-        JOIN goods g ON c.product_id = g.id
-        WHERE c.user_id = $1
-    """, user_id)
+            # Получаем товары из корзины
+            cart_items = await conn.fetch("""
+                SELECT g.id, g.name, g.price, c.quantity
+                FROM carts c
+                JOIN goods g ON c.product_id = g.id
+                WHERE c.user_id = $1
+            """, user_id)
 
-    if not cart_items:
-        await callback_query.answer("Ваша корзина пуста!")
-        await conn.close()
-        return
+            if not cart_items:
+                await callback_query.answer("Ваша корзина пуста!")
+                return
 
-    # Рассчитываем общую сумму заказа
-    total_price = sum(item["price"] * item["quantity"] for item in cart_items)
+            # Рассчитываем общую сумму заказа
+            total_price = sum(item["price"] * item["quantity"] for item in cart_items)
 
-    # Проверяем, хватает ли баланса
-    if balance < total_price:
-        await callback_query.message.answer("❌ Недостаточно средств! Пополните баланс.")
-        await callback_query.answer("❌ Недостаточно средств! Пополните баланс.")
-        await conn.close()
-        return
+            # Проверяем, хватает ли баланса
+            if balance < total_price:
+                await callback_query.message.answer("❌ Недостаточно средств! Пополните баланс.")
+                await callback_query.answer("❌ Недостаточно средств! Пополните баланс.")
+                return
 
-    # Уменьшаем баланс пользователя
-    await conn.execute("UPDATE users SET balance = balance - $1 WHERE telegram_id = $2", total_price, user_id)
+            # Уменьшаем баланс пользователя
+            await conn.execute(
+                "UPDATE users SET balance = balance - $1 WHERE telegram_id = $2", total_price, user_id
+            )
 
-    # Создаём заказ
-    order_row = await conn.fetchrow(
-        "INSERT INTO orders (user_id, total_price) VALUES ($1, $2) RETURNING id",
-        user_id, total_price
-    )
-    order_id = order_row["id"]
+            # Создаём заказ и получаем его ID
+            order_row = await conn.fetchrow(
+                "INSERT INTO orders (user_id, total_price) VALUES ($1, $2) RETURNING id",
+                user_id, total_price
+            )
+            order_id = order_row["id"]
 
-    # Добавляем товары в order_items
-    for item in cart_items:
-        await conn.execute(
-            "INSERT INTO order_items (order_id, product_name, quantity, price, total_price) VALUES ($1, $2, $3, $4, $5)",
-            order_id, item["name"], item["quantity"], item["price"], item["price"] * item["quantity"]
-        )
+            # Добавляем товары в order_items
+            await conn.executemany(
+                "INSERT INTO order_items (order_id, product_name, quantity, price, total_price) VALUES ($1, $2, $3, $4, $5)",
+                [(order_id, item["name"], item["quantity"], item["price"], item["price"] * item["quantity"]) for item in cart_items]
+            )
 
-    # Уменьшаем количество товаров в таблице goods
-    for item in cart_items:
-        await conn.execute(
-            "UPDATE goods SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2",
-            item["quantity"], item["id"]
-        )
+            # Уменьшаем количество товаров в таблице goods
+            await conn.executemany(
+                "UPDATE goods SET quantity = GREATEST(quantity - $1, 0) WHERE id = $2",
+                [(item["quantity"], item["id"]) for item in cart_items]
+            )
 
-    # Очищаем корзину
-    await conn.execute("DELETE FROM carts WHERE user_id = $1", user_id)
-
-    await conn.close()
+            # Очищаем корзину пользователя
+            await conn.execute("DELETE FROM carts WHERE user_id = $1", user_id)
 
     await callback_query.answer("✅ Заказ оформлен!")
-    await callback_query.message.answer("Ваш заказ успешно оформлен! Спасибо за покупку.\nС важи скоро свяжется наш менеджер.\nПерейдите в раздел 'Мои заказы'.")
+    await callback_query.message.answer(
+        "Ваш заказ успешно оформлен! Спасибо за покупку.\n"
+        "С вами скоро свяжется наш менеджер.\n"
+        "Перейдите в раздел 'Мои заказы'."
+    )
+
 
 # Хендлер для кнопки "Мои заказы"
 @dp.message_handler(lambda message: message.text == "Мои заказы")
 async def show_orders(message: types.Message):
     user_id = message.from_user.id
-    conn = await get_db_connection()
 
-    # Получаем заказы пользователя
-    orders = await conn.fetch(
-        "SELECT id, total_price, created_at FROM orders WHERE user_id = $1 ORDER BY created_at ASC",
-        user_id
-    )
-
-    if not orders:
-        await message.answer("❌ У вас пока нет заказов.")
-        await conn.close()
-        return
-
-    for order in orders:
-        order_id = order["id"]
-        total_price = order["total_price"]
-        created_at = order["created_at"].strftime("%d.%m.%Y %H:%M")
-
-        # Получаем товары для этого заказа
-        items = await conn.fetch(
-            "SELECT product_name, quantity, price FROM order_items WHERE order_id = $1",
-            order_id
+    async with db_pool.acquire() as conn:
+        # Получаем заказы пользователя
+        orders = await conn.fetch(
+            "SELECT id, total_price, created_at FROM orders WHERE user_id = $1 ORDER BY created_at ASC",
+            user_id
         )
 
-        items_text = "\n".join(
-            [f"📦 {item['product_name']} (x{item['quantity']}) - {item['price']} руб за 1шт." for item in items]
-        )
+        if not orders:
+            await message.answer("❌ У вас пока нет заказов.")
+            return
 
-        text = (f"📋 Заказ №{order_id} от {created_at}\n\n"
-                f"{items_text}\n\n"
-                f"💰 Итоговая сумма: {total_price} руб.")   
+        for order in orders:
+            order_id = order["id"]
+            total_price = order["total_price"]
+            created_at = order["created_at"].strftime("%d.%m.%Y %H:%M")
 
-        await message.answer(text)
+            # Получаем товары для этого заказа
+            items = await conn.fetch(
+                "SELECT product_name, quantity, price FROM order_items WHERE order_id = $1",
+                order_id
+            )
+
+            items_text = "\n".join(
+                [f"📦 {item['product_name']} (x{item['quantity']}) - {item['price']} руб за 1шт." for item in items]
+            )
+
+            text = (f"📋 Заказ №{order_id} от {created_at}\n\n"
+                    f"{items_text}\n\n"
+                    f"💰 Итоговая сумма: {total_price} руб.")   
+
+            await message.answer(text)
 
     await message.answer("👨🏻‍💻 ***По поводу срока выполнения заказа и доставки с вами свяжется менеджер\!***", parse_mode="MarkdownV2")
-
-    await conn.close()
 
 # Хендлер для кнопки "Мой баланс"
 @dp.message_handler(lambda message: message.text == "Мой баланс")
 async def show_balance(message: types.Message):
     user_id = message.from_user.id
-    conn = await get_db_connection()
 
     # Получаем баланс пользователя
-    balance = await conn.fetchrow("SELECT COALESCE(balance, 0) FROM users WHERE telegram_id = $1", user_id)
-
-    await conn.close()
+    async with db_pool.acquire() as conn:
+        balance = await conn.fetchrow("SELECT COALESCE(balance, 0) FROM users WHERE telegram_id = $1", user_id)
 
     balance_value = balance[0] if balance else 0
 
@@ -353,11 +344,10 @@ async def process_top_up_amount(message: types.Message, state: FSMContext):
             return
 
         user_id = message.from_user.id
-        conn = await get_db_connection()
 
         # Обновляем баланс
-        await conn.execute("UPDATE users SET balance = balance + $1 WHERE telegram_id = $2", amount, user_id)
-        await conn.close()
+        async with db_pool.acquire() as conn:
+            await conn.execute("UPDATE users SET balance = balance + $1 WHERE telegram_id = $2", amount, user_id)
 
         await message.answer(f"Баланс успешно пополнен на {amount} руб.")
         await state.finish()
@@ -366,5 +356,9 @@ async def process_top_up_amount(message: types.Message, state: FSMContext):
         await message.answer("Введите корректное число.")
 
 
+async def main():
+    await create_db_pool()  # Запускаем пул соединений
+    await dp.start_polling()  # Запускаем бота
+
 if __name__ == "__main__":
-    executor.start_polling(dp, skip_updates=True)
+    asyncio.run(main())  # Асинхронно запускаем бота
