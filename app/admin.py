@@ -1,7 +1,8 @@
 import os
-import requests
+import aiohttp
+import asyncpg
+import asyncio
 from dotenv import load_dotenv
-import psycopg2
 from aiogram import Bot, Dispatcher, types
 from aiogram.types import ContentType
 from aiogram.utils import executor
@@ -15,140 +16,104 @@ bot_token = os.getenv('BOT_TOKEN')
 imgbb_api_key = os.getenv('IMGBB_API_KEY')
 
 bot = Bot(token=bot_token)
-
-# Используем MemoryStorage для хранения состояний
 storage = MemoryStorage()
 dp = Dispatcher(bot, storage=storage)
 
-def get_db_connection():
-    return psycopg2.connect(
-        dbname=os.getenv('DB_NAME'),
+async def get_db_connection():
+    return await asyncpg.connect(
         user=os.getenv('DB_USER'),
         password=os.getenv('DB_PASSWORD'),
+        database=os.getenv('DB_NAME'),
         host=os.getenv('DB_HOST'),
         port=os.getenv('DB_PORT'),
     )
 
-# Функция загрузки изображения в imgbb
-def upload_to_imgbb(image_path):
+async def upload_to_imgbb(image_path):
     url = "https://api.imgbb.com/1/upload"
-    with open(image_path, "rb") as file:
-        response = requests.post(url, data={"key": imgbb_api_key}, files={"image": file})
-    
-    print(response.json())  # Смотрим, что возвращает API
+    async with aiohttp.ClientSession() as session:
+        with open(image_path, "rb") as file:
+            form = aiohttp.FormData()
+            form.add_field("key", imgbb_api_key)
+            form.add_field("image", file, filename=image_path)
+            async with session.post(url, data=form) as response:
+                result = await response.json()
+                if response.status == 200:
+                    return result["data"]["image"]["url"]
+                return None
 
-    if response.status_code == 200:
-        return response.json()["data"]["image"]["url"]  # Правильный путь
-    else:
-        print("Ошибка загрузки:", response.json())
-        return None
-
-# Добавление товара в БД
-def add_product_to_db(name, description, quantity, price, image_url):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        "INSERT INTO goods (name, description, quantity, price, image_url) VALUES (%s, %s, %s, %s, %s)",
-        (name, description, quantity, price, image_url)
+async def add_product_to_db(name, description, quantity, price, image_url):
+    conn = await get_db_connection()
+    await conn.execute(
+        "INSERT INTO goods (name, description, quantity, price, image_url) VALUES ($1, $2, $3, $4, $5)",
+        name, description, quantity, price, image_url
     )
-    conn.commit()
-    cursor.close()
-    conn.close()
+    await conn.close()
 
-# Классы состояний для FSM
 class ProductStates(StatesGroup):
     waiting_for_name = State()
     waiting_for_description = State()
     waiting_for_quantity = State()
-    waiting_for_price = State()  # Новый шаг для ввода цены
+    waiting_for_price = State()
     waiting_for_image = State()
 
-# Обработчик команды /start
 @dp.message_handler(commands=['start'])
 async def start(message: types.Message):
-    await message.answer("Привет, я административный бот интернет-магазина, введи команду /add_product для добавления товара!")
+    await message.answer("Привет! Введи команду /add_product для добавления товара.")
 
-# Запуск добавления товара
 @dp.message_handler(commands=['add_product'])
 async def start_adding_product(message: types.Message):
     await message.answer("Введите название товара:")
-    await ProductStates.waiting_for_name.set()  # Устанавливаем состояние
+    await ProductStates.waiting_for_name.set()
 
-# Шаг 1: Получаем название товара
 @dp.message_handler(state=ProductStates.waiting_for_name)
 async def get_product_name(message: types.Message, state: FSMContext):
-    product_name = message.text
-    await state.update_data(product_name=product_name)  # Сохраняем название товара
+    await state.update_data(product_name=message.text)
     await message.answer("Введите описание товара:")
-    await ProductStates.waiting_for_description.set()  # Переходим к следующему шагу
+    await ProductStates.waiting_for_description.set()
 
-# Шаг 2: Получаем описание товара
 @dp.message_handler(state=ProductStates.waiting_for_description)
 async def get_product_description(message: types.Message, state: FSMContext):
-    product_description = message.text
-    await state.update_data(product_description=product_description)  # Сохраняем описание товара
+    await state.update_data(product_description=message.text)
     await message.answer("Введите количество товара:")
-    await ProductStates.waiting_for_quantity.set()  # Переходим к следующему шагу
+    await ProductStates.waiting_for_quantity.set()
 
-# Шаг 3: Получаем количество товара
 @dp.message_handler(state=ProductStates.waiting_for_quantity)
 async def get_product_quantity(message: types.Message, state: FSMContext):
     try:
-        product_quantity = int(message.text)
-        await state.update_data(product_quantity=product_quantity)  # Сохраняем количество
+        await state.update_data(product_quantity=int(message.text))
         await message.answer("Введите цену товара:")
-        await ProductStates.waiting_for_price.set()  # Переходим к следующему шагу
+        await ProductStates.waiting_for_price.set()
     except ValueError:
-        await message.answer("Пожалуйста, введите количество числом.")
+        await message.answer("Введите число.")
 
-# Шаг 4: Получаем цену товара
 @dp.message_handler(state=ProductStates.waiting_for_price)
 async def get_product_price(message: types.Message, state: FSMContext):
     try:
-        product_price = float(message.text)  # Преобразуем цену в число с плавающей точкой
-        await state.update_data(product_price=product_price)  # Сохраняем цену
+        await state.update_data(product_price=float(message.text))
         await message.answer("Отправьте изображение товара:")
-        await ProductStates.waiting_for_image.set()  # Переходим к следующему шагу
+        await ProductStates.waiting_for_image.set()
     except ValueError:
-        await message.answer("Пожалуйста, введите цену числом.")
+        await message.answer("Введите число.")
 
-# Шаг 5: Получаем изображение товара
 @dp.message_handler(content_types=ContentType.PHOTO, state=ProductStates.waiting_for_image)
 async def get_product_image(message: types.Message, state: FSMContext):
-    # Загружаем изображение
     file_id = message.photo[-1].file_id
     file_info = await bot.get_file(file_id)
     file_path = file_info.file_path
     downloaded_file = await bot.download_file(file_path)
-
-    # Сохраняем временный файл
+    
     product_data = await state.get_data()
-    product_name = product_data["product_name"]
-    image_name = f"{product_name.replace(' ', '_')}.jpg"
-    local_image_path = f"temp_{image_name}"
-
-    # Записываем файл в локальную систему как байты
-    with open(local_image_path, "wb") as new_file:
-        new_file.write(downloaded_file.getvalue())  # Преобразуем в байты
-
-    # Загружаем в imgbb
-    image_url = upload_to_imgbb(local_image_path)
-
-    # Удаляем временный файл
-    os.remove(local_image_path)
-
+    image_name = f"temp_{product_data['product_name'].replace(' ', '_')}.jpg"
+    
+    await asyncio.to_thread(lambda: open(image_name, "wb").write(downloaded_file.getvalue()))
+    image_url = await upload_to_imgbb(image_name)
+    await asyncio.to_thread(lambda: os.remove(image_name))
+    
     if image_url:
-        # Добавляем товар в базу данных
-        await state.update_data(image_url=image_url)  # Сохраняем URL изображения
-        product_description = product_data["product_description"]
-        product_quantity = product_data["product_quantity"]
-        product_price = product_data["product_price"]
-        add_product_to_db(product_name, product_description, product_quantity, product_price, image_url)
-        await message.answer(f"Товар '{product_name}' успешно добавлен!")
+        await add_product_to_db(product_data['product_name'], product_data['product_description'], product_data['product_quantity'], product_data['product_price'], image_url)
+        await message.answer(f"Товар '{product_data['product_name']}' успешно добавлен!")
     else:
-        await message.answer("Ошибка загрузки фото. Попробуйте снова.")
-
-    # Завершаем процесс добавления товара
+        await message.answer("Ошибка загрузки фото.")
     await state.finish()
 
 if __name__ == "__main__":
